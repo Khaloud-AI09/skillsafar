@@ -1,6 +1,8 @@
 import { GoogleGenAI } from "@google/genai";
 
 const MAX_TEXT_LENGTH = 18000;
+const PRIMARY_MODEL = process.env.GEMINI_MODEL || "gemini-3.8-flash";
+const FALLBACK_MODEL = "gemini-3.5-flash-lite";
 
 const responseSchema = {
   type: "OBJECT",
@@ -18,9 +20,17 @@ const responseSchema = {
     caveats: { type: "ARRAY", items: { type: "STRING" } }
   },
   required: [
-    "role_title", "ats_score", "summary", "strengths", "matched_keywords",
-    "missing_keywords", "experience_gaps", "improvements", "next_steps",
-    "role_fit", "caveats"
+    "role_title",
+    "ats_score",
+    "summary",
+    "strengths",
+    "matched_keywords",
+    "missing_keywords",
+    "experience_gaps",
+    "improvements",
+    "next_steps",
+    "role_fit",
+    "caveats"
   ]
 };
 
@@ -42,6 +52,49 @@ CORE PRINCIPLES:
 - Return only JSON matching the requested schema.
 `;
 
+function isTemporaryError(error) {
+  const status = error?.status || error?.error?.code;
+  return status === 429 || status === 500 || status === 502 || status === 503 || status === 504;
+}
+
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+async function generateWithRetry(ai, model, prompt) {
+  let lastError;
+
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    try {
+      return await ai.models.generateContent({
+        model,
+        contents: prompt,
+        config: {
+          systemInstruction,
+          responseMimeType: "application/json",
+          responseSchema,
+          temperature: 0.25,
+          maxOutputTokens: 3500
+        }
+      });
+    } catch (error) {
+      lastError = error;
+
+      if (!isTemporaryError(error) || attempt === 2) {
+        throw error;
+      }
+
+      console.warn(
+        `Gemini temporary error (${error?.status}). Retrying in 1500ms...`
+      );
+
+      await sleep(1500);
+    }
+  }
+
+  throw lastError;
+}
+
 export default async function handler(req, res) {
   if (req.method !== "POST") {
     res.setHeader("Allow", "POST");
@@ -49,24 +102,42 @@ export default async function handler(req, res) {
   }
 
   const apiKey = process.env.GEMINI_API_KEY;
+
   if (!apiKey) {
-    return res.status(500).json({ error: "Server configuration is incomplete. Add GEMINI_API_KEY to your deployment environment variables." });
+    return res.status(500).json({
+      error:
+        "Server configuration is incomplete. Add GEMINI_API_KEY to your deployment environment variables."
+    });
   }
 
-  const resume = typeof req.body?.resume === "string" ? req.body.resume.trim() : "";
-  const jobDescription = typeof req.body?.jobDescription === "string" ? req.body.jobDescription.trim() : "";
+  const resume =
+    typeof req.body?.resume === "string"
+      ? req.body.resume.trim()
+      : "";
+
+  const jobDescription =
+    typeof req.body?.jobDescription === "string"
+      ? req.body.jobDescription.trim()
+      : "";
 
   if (resume.length < 80 || jobDescription.length < 80) {
-    return res.status(400).json({ error: "Please provide a fuller resume and job description (at least 80 characters each)." });
-  }
-  if (resume.length > MAX_TEXT_LENGTH || jobDescription.length > MAX_TEXT_LENGTH) {
-    return res.status(413).json({ error: "One of the text fields is too long. Please keep each under 18,000 characters." });
+    return res.status(400).json({
+      error:
+        "Please provide a fuller resume and job description (at least 80 characters each)."
+    });
   }
 
-  try {
-    const ai = new GoogleGenAI({ apiKey });
-    const model = process.env.GEMINI_MODEL || "gemini-3.8-flash";
-    const prompt = `
+  if (
+    resume.length > MAX_TEXT_LENGTH ||
+    jobDescription.length > MAX_TEXT_LENGTH
+  ) {
+    return res.status(413).json({
+      error:
+        "One of the text fields is too long. Please keep each under 18,000 characters."
+    });
+  }
+
+  const prompt = `
 Analyze the following candidate resume against the job description.
 
 RESUME:
@@ -89,28 +160,61 @@ Return a JSON object with:
 - caveats: limitations, uncertainties, and reminders not to claim unsupported skills
 `;
 
-    const result = await ai.models.generateContent({
-      model,
-      contents: prompt,
-      config: {
-        systemInstruction,
-        responseMimeType: "application/json",
-        responseSchema,
-        temperature: 0.25,
-        maxOutputTokens: 3500
+  try {
+    const ai = new GoogleGenAI({ apiKey });
+
+    let result;
+
+    try {
+      console.log(`SkillSafar: trying primary model ${PRIMARY_MODEL}`);
+      result = await generateWithRetry(ai, PRIMARY_MODEL, prompt);
+    } catch (primaryError) {
+      console.error(
+        `Primary model ${PRIMARY_MODEL} failed:`,
+        primaryError
+      );
+
+      if (!isTemporaryError(primaryError)) {
+        throw primaryError;
       }
-    });
+
+      console.log(`SkillSafar: trying fallback model ${FALLBACK_MODEL}`);
+
+      result = await generateWithRetry(
+        ai,
+        FALLBACK_MODEL,
+        prompt
+      );
+    }
 
     const raw = result.text;
-    if (!raw) throw new Error("The AI returned an empty response.");
+
+    if (!raw) {
+      throw new Error("The AI returned an empty response.");
+    }
+
     const analysis = JSON.parse(raw);
-    analysis.ats_score = Math.max(0, Math.min(100, Number(analysis.ats_score) || 0));
+
+    analysis.ats_score = Math.max(
+      0,
+      Math.min(100, Number(analysis.ats_score) || 0)
+    );
 
     return res.status(200).json({ analysis });
+
   } catch (error) {
     console.error("SkillSafar analysis error:", error);
+
+    if (isTemporaryError(error)) {
+      return res.status(503).json({
+        error:
+          "Gemini is temporarily busy. SkillSafar tried again, but the AI provider is still unavailable. Please try again in a few minutes."
+      });
+    }
+
     return res.status(502).json({
-      error: "SkillSafar could not complete the analysis. Check your model access and API configuration, then try again."
+      error:
+        "SkillSafar could not complete the analysis. Please check the Gemini configuration and try again."
     });
   }
 }
