@@ -1,4 +1,4 @@
-# SkillSafar — Advanced AI Career Companion
+# SkillSafar — Advanced AI Career Companion(ApnoAI Final Project)
 
 SkillSafar compares a resume with a job description and returns evidence-led career guidance.
 
